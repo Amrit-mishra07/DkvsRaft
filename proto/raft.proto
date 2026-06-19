@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package raft;
+
+option go_package = "dkvsraft/proto;proto";
+
+// LogEntry represents a single entry in the replicated log.
+message LogEntry {
+  int64 term = 1;
+  string command = 2; // In a real system, this might be bytes, but string is fine for simple KV
+}
+
+// ----------------------------------------------------------------------------
+// RequestVote RPC
+// ----------------------------------------------------------------------------
+
+message RequestVoteArgs {
+  int64 term = 1;             // candidate's term
+  int32 candidateId = 2;      // candidate requesting vote
+  int64 lastLogIndex = 3;     // index of candidate's last log entry
+  int64 lastLogTerm = 4;      // term of candidate's last log entry
+}
+
+message RequestVoteReply {
+  int64 term = 1;             // currentTerm, for candidate to update itself
+  bool voteGranted = 2;       // true means candidate received vote
+}
+
+// ----------------------------------------------------------------------------
+// AppendEntries RPC
+// ----------------------------------------------------------------------------
+
+message AppendEntriesArgs {
+  int64 term = 1;             // leader's term
+  int32 leaderId = 2;         // so follower can redirect clients
+  int64 prevLogIndex = 3;     // index of log entry immediately preceding new ones
+  int64 prevLogTerm = 4;      // term of prevLogIndex entry
+  repeated LogEntry entries = 5; // log entries to store (empty for heartbeat)
+  int64 leaderCommit = 6;     // leader's commitIndex
+}
+
+message AppendEntriesReply {
+  int64 term = 1;             // currentTerm, for leader to update itself
+  bool success = 2;           // true if follower contained entry matching prevLogIndex and prevLogTerm
+}
+
+// ----------------------------------------------------------------------------
+// The Raft Service
+// ----------------------------------------------------------------------------
+
+service RaftService {
+  // Invoked by candidates to gather votes
+  rpc RequestVote(RequestVoteArgs) returns (RequestVoteReply);
+
+  // Invoked by leader to replicate log entries; also used as heartbeat
+  rpc AppendEntries(AppendEntriesArgs) returns (AppendEntriesReply);
+}

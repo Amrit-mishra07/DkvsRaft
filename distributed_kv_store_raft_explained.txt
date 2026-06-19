@@ -1,0 +1,193 @@
+DISTRIBUTED KEY-VALUE STORE WITH RAFT CONSENSUS
+A Deep Explanation
+=================================================
+
+1. THE CORE PROBLEM
+--------------------
+A normal key-value store is just a hashmap sitting on one server. It has two
+fatal weaknesses:
+
+  a) If that one server crashes, the data is gone or unreachable until it
+     comes back. There is no backup serving traffic in the meantime.
+
+  b) All reads and writes have to go through that single machine, so it
+     cannot scale beyond what one machine can handle.
+
+The fix sounds simple: run the same data on multiple machines (nodes) so
+that if one dies, the others keep serving. But this creates a much harder
+problem underneath it -- how do multiple independent machines agree on
+what the "current" data actually is, especially when:
+
+  - Writes are happening continuously
+  - Machines can crash at any moment, including mid-write
+  - The network between them can be slow, dropped, or partitioned
+
+This agreement problem is called CONSENSUS. Raft is one of the most widely
+used algorithms for solving it (Google, etcd, Consul, CockroachDB, and many
+internal systems use Raft or Raft-like protocols). Building this project is
+really about proving you understand how distributed systems stay correct
+when things fail -- which is exactly the skill the internship listing
+points at.
+
+
+2. WHAT YOU ARE ACTUALLY BUILDING
+----------------------------------
+A cluster of 3 (or 5) nodes that, from the outside, behaves like a single
+reliable key-value store. A client sends PUT key value or GET key, and it
+does not matter which individual node is up or down -- as long as a
+MAJORITY of nodes are alive and reachable, the system keeps working
+correctly.
+
+The project has two layers:
+
+  LAYER 1 -- Raft (the consensus engine)
+  This is the part that makes all nodes agree on the order of operations,
+  even under failure. It is responsible for THREE jobs:
+
+    1. Leader election
+       At any moment, exactly one node is the "leader." All client writes
+       go through the leader. If the leader dies, the remaining nodes
+       detect this and elect a new leader automatically.
+
+    2. Log replication
+       Every write is treated as a command (e.g. "SET name = amrit") and
+       appended to an ordered log. The leader copies this log to the
+       followers. Once a MAJORITY of nodes have the entry in their log,
+       it becomes "committed" -- meaning it is now permanent and will
+       never be lost or undone, even if nodes crash afterward.
+
+    3. Safety
+       Raft guarantees that all nodes apply commands in the exact same
+       order. This is what prevents two nodes from ever disagreeing about
+       the final state of the data.
+
+  LAYER 2 -- The key-value store (the application on top)
+  This part is intentionally simple: a plain hashmap (key -> value) per
+  node. Whenever Raft tells a node "this log entry is now committed," the
+  node applies the corresponding command to its own hashmap. Reads are
+  served directly from this hashmap.
+
+  The KV store layer does not need to know anything about elections, votes,
+  or network failures -- Raft handles all of that underneath it. This
+  separation (consensus layer vs. application layer) is itself an important
+  systems design idea worth understanding.
+
+
+3. HOW A WRITE FLOWS, STEP BY STEP
+------------------------------------
+  1. Client sends PUT name=amrit to whichever node is currently the leader.
+  2. The leader appends this command to its own local log (not yet
+     committed).
+  3. The leader sends this log entry to all follower nodes via an
+     AppendEntries message.
+  4. Each follower appends the entry to its own log and replies
+     acknowledging receipt.
+  5. Once the leader has heard back from a MAJORITY of nodes (including
+     itself), the entry is marked COMMITTED.
+  6. The leader applies the command to its own hashmap and replies success
+     to the client.
+  7. On the next heartbeat, the leader informs followers that the entry is
+     committed; they then apply it to their own hashmaps too.
+
+  Why "majority" matters: if the leader crashes right after step 3 but
+  before step 5, the entry is NOT yet committed, so it is safe to discard
+  or retry -- no node will treat it as permanent. If the leader crashes
+  right after step 5, a majority already has the entry durably stored, so
+  a newly elected leader is guaranteed (by Raft's election rules) to also
+  have that entry, and the system never loses committed data. This
+  distinction between "written to a log" and "committed" is the single
+  most important idea in the whole project, and the part most worth being
+  able to explain clearly in an interview.
+
+
+4. HOW LEADER ELECTION WORKS
+-------------------------------
+  1. Every follower expects a heartbeat message from the current leader at
+     regular intervals.
+  2. If a follower does not hear a heartbeat within its election timeout,
+     it assumes the leader has died. It becomes a CANDIDATE, increases an
+     internal counter called the "term" by one, and requests votes from
+     every other node.
+  3. Other nodes vote for the first candidate they see in that term,
+     PROVIDED the candidate's log is at least as up to date as their own
+     (this check is what prevents an out-of-date node from becoming leader
+     and silently losing committed data).
+  4. Whoever receives votes from a MAJORITY of nodes becomes the new
+     leader for that term and starts sending heartbeats immediately.
+  5. If two nodes become candidates at the same time and the vote splits
+     with no majority, the term simply times out and a new election round
+     starts with a higher term number. This is rare but normal, and worth
+     mentioning if asked about edge cases.
+
+
+5. WHY "MAJORITY" IS THE KEY IDEA
+------------------------------------
+Almost everything in Raft revolves around majority agreement rather than
+unanimous agreement. With 3 nodes, a majority is 2. This means:
+
+  - The system tolerates ONE node failure and keeps working normally.
+  - With 5 nodes, it tolerates TWO failures.
+  - Because any two majorities (out of any group) must overlap by at least
+    one node, it is mathematically impossible for two different leaders to
+    both believe they have committed conflicting data at the same time.
+
+This overlap property is the actual mathematical reason Raft is safe, and
+is a great thing to be able to say out loud in an interview.
+
+
+6. WHAT TO DELIBERATELY SKIP (SCOPE CONTROL)
+-----------------------------------------------
+For a project built in about a week, these should be explicitly left out so
+you can finish and deeply understand the core mechanism instead of half-
+building everything:
+
+  - Log compaction / snapshotting (used in production to keep logs from
+    growing forever)
+  - Dynamic cluster membership changes (adding/removing nodes while
+    running)
+  - Disk persistence (in-memory state is fine for a demo)
+  - TLS / authentication / access control
+
+Mentioning that you knowingly scoped these out -- and why -- is itself a
+good signal in an interview. It shows deliberate engineering judgment
+rather than just "I ran out of time."
+
+
+7. WHY THIS PROJECT IS STRONG FOR AN INTERVIEW
+--------------------------------------------------
+When asked "tell me about a project," this lets you talk through:
+
+  - Why a single-node KV store is not fault tolerant, and what replication
+    actually buys you
+  - The difference between a log entry being "written" vs. "committed,"
+    and why that distinction prevents data loss
+  - How leader election works and why majority voting prevents two leaders
+    from existing at once
+  - What happens, step by step, if the leader crashes mid-write
+  - What you intentionally left out and why (showing scope judgment, not
+    just code output)
+
+That is a fundamentally different conversation than "I used a database" --
+it is "I understand why the database behaves correctly," which is the
+actual signal a distributed-systems-focused internship screen is looking
+for.
+
+
+8. SUGGESTED BUILD ORDER (ROUGH PACING)
+-------------------------------------------
+  Days 1-2: Leader election only (3 nodes, heartbeats, RequestVote RPC).
+            Success test: kill the leader process, watch a new one get
+            elected within a few seconds.
+
+  Days 3-5: Log replication (AppendEntries RPC, commit index tracking via
+            majority acknowledgment). Keep the log in memory only.
+
+  Days 6-7: KV store layer on top -- a simple map, applied only once Raft
+            marks an entry committed. Expose PUT / GET / DELETE over HTTP
+            or gRPC.
+
+  Day 8:    Client/demo script that sends writes and reads, and a scripted
+            demo that kills the leader mid-operation to show recovery.
+
+  Day 9:    Write the README explaining the design and the crash-recovery
+            behavior -- this README doubles as your interview prep notes.

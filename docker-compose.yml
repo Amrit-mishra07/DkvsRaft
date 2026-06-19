@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  node1:
+    build: .
+    command: go run server/main.go -id 1 -port 50051
+    environment:
+      - NODE_ID=1
+      - PEERS=node2:50052,node3:50053
+    ports:
+      - "50051:50051"
+    networks:
+      - raft-network
+
+  node2:
+    build: .
+    command: go run server/main.go -id 2 -port 50052
+    environment:
+      - NODE_ID=2
+      - PEERS=node1:50051,node3:50053
+    ports:
+      - "50052:50052"
+    networks:
+      - raft-network
+
+  node3:
+    build: .
+    command: go run server/main.go -id 3 -port 50053
+    environment:
+      - NODE_ID=3
+      - PEERS=node1:50051,node2:50052
+    ports:
+      - "50053:50053"
+    networks:
+      - raft-network
+
+networks:
+  raft-network:
+    driver: bridge
