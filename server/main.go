@@ -57,7 +57,7 @@ func main() {
 	node.Start()
 	defer node.Stop()
 
-	// Simple HTTP API for testing log replication
+	// POST /submit (Accepts raw text like "SET key value")
 	http.HandleFunc("/submit", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Only POST supported", http.StatusMethodNotAllowed)
@@ -78,10 +78,40 @@ func main() {
 				"term":    term,
 			})
 		} else {
-			w.WriteHeader(http.StatusServiceUnavailable)
+			w.WriteHeader(http.StatusServiceUnavailable) // HTTP 503 so client knows to retry elsewhere
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"success": false,
 				"message": "Not the leader",
+			})
+		}
+	})
+
+	// GET /get?key=xyz
+	http.HandleFunc("/get", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Only GET supported", http.StatusMethodNotAllowed)
+			return
+		}
+		
+		key := r.URL.Query().Get("key")
+		if key == "" {
+			http.Error(w, "Missing key parameter", http.StatusBadRequest)
+			return
+		}
+
+		val, found := node.Get(key)
+		w.Header().Set("Content-Type", "application/json")
+		if found {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": true,
+				"key":     key,
+				"value":   val,
+			})
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Key not found",
 			})
 		}
 	})

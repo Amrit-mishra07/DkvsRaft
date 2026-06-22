@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"math/rand"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,6 +36,10 @@ type Node struct {
 	nextIndex  map[string]int64
 	matchIndex map[string]int64
 
+	// Application State Machine
+	kvStore map[string]string
+	applyCh chan struct{}
+
 	electionTimer  *time.Timer
 	heartbeatTimer *time.Timer
 
@@ -55,6 +60,8 @@ func NewNode(id int32, peers []string) *Node {
 		state:          Follower,
 		nextIndex:      make(map[string]int64),
 		matchIndex:     make(map[string]int64),
+		kvStore:        make(map[string]string),
+		applyCh:        make(chan struct{}, 1),
 		peers:          peers,
 		peerClients:    make(map[string]pb.RaftServiceClient),
 		ctx:            ctx,
@@ -74,6 +81,7 @@ func NewNode(id int32, peers []string) *Node {
 func (n *Node) Start() {
 	n.connectToPeers()
 	go n.runLoop()
+	go n.applyLoop()
 }
 
 func (n *Node) Stop() {
@@ -209,7 +217,6 @@ func (n *Node) becomeFollower(term int64) {
 	log.Printf("[Node %d] Became Follower for term %d", n.id, term)
 }
 
-// Submit allows a client to submit a command to the leader
 func (n *Node) Submit(command string) (bool, int64, int64) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -287,7 +294,6 @@ func (n *Node) sendAppendEntries() {
 					n.updateCommitIndex()
 				}
 			} else {
-				// Decrement nextIndex and retry 
 				n.nextIndex[p]--
 				if n.nextIndex[p] < 1 {
 					n.nextIndex[p] = 1
@@ -311,10 +317,65 @@ func (n *Node) updateCommitIndex() {
 		if matches > len(n.peers)/2 && n.log[newCommitIndex].Term == n.currentTerm {
 			n.commitIndex = newCommitIndex
 			log.Printf("[Node %d] Leader advanced commitIndex to %d", n.id, n.commitIndex)
+			n.triggerApply()
 		} else {
 			break
 		}
 	}
+}
+
+func (n *Node) triggerApply() {
+	select {
+	case n.applyCh <- struct{}{}:
+	default:
+	}
+}
+
+func (n *Node) applyLoop() {
+	for {
+		select {
+		case <-n.ctx.Done():
+			return
+		case <-n.applyCh:
+			n.mu.Lock()
+			for n.lastApplied < n.commitIndex {
+				n.lastApplied++
+				entry := n.log[n.lastApplied]
+				n.applyCommand(entry.Command)
+			}
+			n.mu.Unlock()
+		}
+	}
+}
+
+func (n *Node) applyCommand(command string) {
+	parts := strings.SplitN(command, " ", 3)
+	if len(parts) == 0 {
+		return
+	}
+	
+	action := strings.ToUpper(parts[0])
+	switch action {
+	case "SET":
+		if len(parts) >= 3 {
+			key, value := parts[1], parts[2]
+			n.kvStore[key] = value
+			log.Printf("[Node %d] StateMachine Applied: SET %s = %s", n.id, key, value)
+		}
+	case "DEL":
+		if len(parts) >= 2 {
+			key := parts[1]
+			delete(n.kvStore, key)
+			log.Printf("[Node %d] StateMachine Applied: DEL %s", n.id, key)
+		}
+	}
+}
+
+func (n *Node) Get(key string) (string, bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	val, ok := n.kvStore[key]
+	return val, ok
 }
 
 func (n *Node) RequestVote(ctx context.Context, args *pb.RequestVoteArgs) (*pb.RequestVoteReply, error) {
@@ -376,7 +437,6 @@ func (n *Node) AppendEntries(ctx context.Context, args *pb.AppendEntriesArgs) (*
 		n.becomeFollower(args.Term)
 	}
 
-	// Log Matching Property
 	if args.PrevLogIndex >= int64(len(n.log)) {
 		return reply, nil
 	}
@@ -384,7 +444,6 @@ func (n *Node) AppendEntries(ctx context.Context, args *pb.AppendEntriesArgs) (*
 		return reply, nil
 	}
 
-	// Resolve conflicts and append new entries
 	insertIndex := args.PrevLogIndex + 1
 	newEntriesIndex := 0
 
@@ -405,7 +464,6 @@ func (n *Node) AppendEntries(ctx context.Context, args *pb.AppendEntriesArgs) (*
 		log.Printf("[Node %d] Appended %d entries, log length is now %d", n.id, len(args.Entries)-newEntriesIndex, len(n.log))
 	}
 
-	// Update commitIndex
 	if args.LeaderCommit > n.commitIndex {
 		lastLogIndex := int64(len(n.log) - 1)
 		if args.LeaderCommit < lastLogIndex {
@@ -414,6 +472,7 @@ func (n *Node) AppendEntries(ctx context.Context, args *pb.AppendEntriesArgs) (*
 			n.commitIndex = lastLogIndex
 		}
 		log.Printf("[Node %d] Follower advanced commitIndex to %d", n.id, n.commitIndex)
+		n.triggerApply()
 	}
 
 	reply.Success = true

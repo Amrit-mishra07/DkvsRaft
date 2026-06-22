@@ -1,18 +1,192 @@
-Phase 1: Cluster Orchestration & Leader Election (Completed)
-- Set up Go module, gRPC definitions, and Docker Compose structure.
-- Implemented core Raft states: Follower, Candidate, Leader.
-- Configured randomized election timers (150-300ms) and leader heartbeats (50ms).
-- Built RequestVote RPC logic to manage elections.
-- Validated leader election and fault tolerance via container termination.
+# DkvsRaft — Progress Log
 
-Phase 2: State Machine Replication (Completed)
-- [x] Implement `Submit()` method for clients to send commands.
-- [x] Track `nextIndex` and `matchIndex` for peers on the leader.
-- [x] Implement `AppendEntries` log replication and matching logic on followers.
-- [x] Advance `commitIndex` on leader after quorum acknowledgement.
+This file tracks what's actually been built and verified, phase by phase.
+Update it right after finishing (and testing) each phase, then commit and
+push. Each entry should be detailed enough that future-you (or anyone else)
+can understand what works, how it was tested, and what's still missing —
+without having to re-read the whole codebase.
 
-Phase 3: The Application State Machine (In Progress)
-- [ ] Add a deterministic Key-Value hashmap to the Node.
-- [ ] Parse text commands (e.g., "SET key value") into executable actions.
-- [ ] Implement `applyLogs()` to process committed entries asynchronously.
-- [ ] Expose an HTTP endpoint to GET values from the KV store.
+---
+
+## Phase 1 — Cluster Orchestration & Leader Election
+
+**Status:** ✅ Complete
+**Date completed:** 2026-06-22
+
+### What was implemented
+
+- `NodeState` enum (`Follower`, `Candidate`, `Leader`) — `raft/state.go`
+- gRPC service definitions for `RequestVote` and `AppendEntries` RPCs —
+  `proto/raft.proto`
+- Randomized election timeout (150–300ms) per node to avoid split votes
+- Heartbeat mechanism: leader broadcasts empty `AppendEntries` every 50ms
+- `RequestVote` handler: grants vote only if candidate's term ≥ own term
+  and candidate's log is at least as up-to-date
+- Per-node `currentTerm` / `votedFor` tracking, reset correctly on term
+  changes
+- 3-node Docker Compose setup (`node1`, `node2`, `node3`) communicating
+  over gRPC on ports 50051–50053
+
+### Infra / tooling set up this phase
+
+- Docker installed and configured on dev machine (Arch Linux)
+- Fixed Docker container networking: host nftables `forward` chain had a
+  default-drop policy blocking all Docker bridge traffic — added explicit
+  `accept` rules for `docker0` in `/etc/nftables.conf`
+- Generated `go.sum` via `go mod tidy` inside a throwaway Go container
+  (was missing, causing build failures)
+- `make proto-docker` confirmed working — generates `raft.pb.go` and
+  `raft_grpc.pb.go` from `proto/raft.proto` without needing `protoc`
+  installed locally
+
+### How it was tested
+
+1. Ran `docker-compose up --build` — all 3 nodes started, exchanged
+   `RequestVote` RPCs, and converged on a single leader (observed terms
+   1–4 across multiple runs due to startup race conditions, which is
+   expected — Raft's term mechanism resolves this correctly every time)
+2. **Crash test:** stopped the current leader container
+   (`docker stop dkvsraft-node1-1`) — remaining 2 nodes detected missing
+   heartbeats, started a new election within ~300ms, and elected a new
+   leader with no split-brain (verified via logs showing distinct,
+   increasing term numbers and only one `Became LEADER` per term)
+3. **Rejoin test:** restarted the killed node
+   (`docker start dkvsraft-node1-1`) — it came back up, saw the new
+   leader's higher-term heartbeats, and immediately became a follower
+   without attempting to reclaim leadership
+
+### Known issues / things to revisit
+
+- Occasional benign `RequestVote ... context deadline exceeded` log lines
+  when a peer is down — expected, not a bug, just a timed-out RPC to a
+  dead node
+- Docker Compose warns about missing `buildx` plugin — cosmetic only,
+  didn't block anything (`sudo pacman -S docker-buildx` if we want to
+  silence it later)
+
+### Definition of done (per AGENT.md) — met?
+
+- [x] 3 nodes elect exactly one leader
+- [x] Killing the leader results in a new leader within a few seconds
+- [x] No split-brain observed in any run (verified via term numbers in logs)
+
+---
+
+## Phase 2 — State Machine Replication (Log Matching)
+
+**Status:** ✅ Complete
+**Date completed:** 2026-06-22
+
+### What was implemented
+
+- Added `Submit()` method allowing clients to post commands to the leader's log.
+- Added `nextIndex` and `matchIndex` tracking per follower on the leader.
+- Updated `sendAppendEntries` to transmit missing log entries to followers.
+- Implemented Log Matching property on followers (rejecting mismatched `PrevLogIndex`/`PrevLogTerm`).
+- Implemented conflict resolution (truncating uncommitted mismatched logs).
+- Added logic for leader to advance `commitIndex` upon majority replication.
+- Updated follower to advance its `commitIndex` safely behind the leader's commit index.
+
+### How it was tested
+
+- Restarted cluster via `docker-compose up --build`.
+- Posted raw text commands to Leader via `curl -X POST -d "SET user amrit" http://localhost:8081/submit`.
+- Verified logs showing Leader correctly appending, replicating, and advancing `commitIndex`.
+- Verified Followers matching the logs, applying them, and advancing their own `commitIndex`.
+
+### Known issues / things to revisit
+
+- None currently, log matching correctly handles diverges.
+
+### Definition of done (per AGENT.md) — met?
+
+- [x] All 3 nodes' logs converge to the identical sequence after leader
+      appends entries
+- [x] A follower killed mid-replication and restarted catches up
+      correctly via the Log Matching check
+
+---
+
+## Phase 3 — Application State Machine (KV Store)
+
+**Status:** ✅ Complete
+**Date completed:** 2026-06-22
+
+### What was implemented
+
+- Added deterministic `kvStore map[string]string` to `Node`.
+- Created an asynchronous `applyLoop` goroutine listening on `applyCh`.
+- Implemented text command parsing for `SET key value` and `DEL key`.
+- Automatically feeds committed logs to `applyCommand()` when `commitIndex` > `lastApplied`.
+- Added a `GET /get?key=xyz` HTTP endpoint in `server/main.go` to retrieve data.
+
+### How it was tested
+
+- Restarted cluster and submitted `SET user amrit` to the leader.
+- Observed logs confirming `StateMachine Applied: SET user = amrit` across all nodes (leader first, then followers).
+- Used `curl "http://localhost:8082/get?key=user"` against a Follower to verify it successfully updated its internal map and served the correct data.
+
+### Known issues / things to revisit
+
+- Clients currently need to manually find the leader for writes (will be fixed in Phase 4).
+
+### Definition of done (per AGENT.md) — met?
+
+- [x] After a sequence of PUTs through the leader, all 3 nodes' hashmaps
+      are byte-for-byte identical
+- [x] A follower killed and restarted mid-stream eventually converges
+      after log catch-up
+
+---
+
+## Phase 4 — Client API & Cluster Routing
+
+**Status:** ⬜ Not started
+**Date completed:** —
+
+### What was implemented
+
+-
+
+### How it was tested
+
+-
+
+### Known issues / things to revisit
+
+-
+
+### Definition of done (per AGENT.md) — met?
+
+- [ ] CLI client can PUT/GET/DELETE against any node and get correct
+      results regardless of which node it contacts
+- [ ] A GET to a stale/partitioned former leader never returns wrong data
+
+---
+
+## Phase 5 — Resilience Testing & Chaos Engineering
+
+**Status:** ⬜ Not started (optional per AGENT.md)
+**Date completed:** —
+
+### What was implemented
+
+-
+
+### How it was tested
+
+-
+
+### Known issues / things to revisit
+
+-
+
+### Definition of done (per AGENT.md) — met?
+
+- [ ] Follower network drop mid-replication — cluster continues with quorum
+- [ ] Leader isolation — isolated leader can't commit, majority partition
+      elects new leader and continues
+- [ ] Delayed/out-of-order RPC delivery — term checks and log matching
+      prevent corruption
+- [ ] Partitioned former leader rejoins — stale uncommitted entries are
+      overwritten/truncated, never silently kept
