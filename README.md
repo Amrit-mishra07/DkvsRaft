@@ -27,7 +27,7 @@ graph TD
         Node1 <-->|gRPC| Node3
     end
 
-    Client -.->|POST /submit (307 Redirect)| Node2
+    Client -.->|POST /submit - 307 Redirect| Node2
     Client -->|POST /submit| Node1
     Client -->|GET /get| Node1
 ```
