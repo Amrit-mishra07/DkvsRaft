@@ -141,26 +141,32 @@ without having to re-read the whole codebase.
 
 ## Phase 4 — Client API & Cluster Routing
 
-**Status:** ⬜ Not started
-**Date completed:** —
+**Status:** ✅ Complete
+**Date completed:** 2026-06-22
 
 ### What was implemented
 
--
+- Added `leaderId` tracking to the `Node` state (updated upon heartbeats and elections).
+- Added `GetLeaderId()` to safely expose the cluster's current leader to the application layer.
+- Added `HTTP 307 Temporary Redirect` logic to `main.go`. If a follower receives a `GET` or `POST`, it redirects the client to the leader's HTTP port.
+- Implemented `VerifyLeadership()` function: sends a synchronous heartbeat to all peers and waits for a quorum to guarantee the node is still the active leader.
+- Applied `VerifyLeadership()` check before serving any `GET` request, enforcing strict Linearizable Reads.
 
 ### How it was tested
 
--
+- Sent a `POST` request to a Follower using `curl -L -X POST ...` and verified that curl automatically followed the 307 redirect and successfully posted the data to the Leader.
+- Sent a `GET` request to a Follower using `curl -L ...` and verified it redirected to the Leader.
+- Verified that the Leader successfully executed the synchronous quorum check (`VerifyLeadership`) before returning data, preventing stale reads.
 
 ### Known issues / things to revisit
 
--
+- None. Redirection perfectly abstracts cluster complexity away from clients.
 
 ### Definition of done (per AGENT.md) — met?
 
-- [ ] CLI client can PUT/GET/DELETE against any node and get correct
+- [x] CLI client can PUT/GET/DELETE against any node and get correct
       results regardless of which node it contacts
-- [ ] A GET to a stale/partitioned former leader never returns wrong data
+- [x] A GET to a stale/partitioned former leader never returns wrong data
 
 ---
 

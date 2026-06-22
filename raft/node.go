@@ -31,6 +31,7 @@ type Node struct {
 	commitIndex int64
 	lastApplied int64
 	state       NodeState
+	leaderId    int32 // Tracks the current leader ID (-1 if unknown)
 
 	// Volatile state on leaders
 	nextIndex  map[string]int64
@@ -58,6 +59,7 @@ func NewNode(id int32, peers []string) *Node {
 		votedFor:       -1,
 		log:            make([]*pb.LogEntry, 0),
 		state:          Follower,
+		leaderId:       -1,
 		nextIndex:      make(map[string]int64),
 		matchIndex:     make(map[string]int64),
 		kvStore:        make(map[string]string),
@@ -68,7 +70,6 @@ func NewNode(id int32, peers []string) *Node {
 		cancel:         cancel,
 	}
 
-	// Dummy entry at index 0
 	n.log = append(n.log, &pb.LogEntry{Term: 0, Command: ""})
 
 	n.electionTimer = time.NewTimer(n.randomElectionTimeout())
@@ -134,6 +135,7 @@ func (n *Node) startElection() {
 	n.state = Candidate
 	n.currentTerm++
 	n.votedFor = n.id
+	n.leaderId = -1 // Unknown leader during election
 	n.resetElectionTimer()
 	log.Printf("[Node %d] Starting election for term %d", n.id, n.currentTerm)
 
@@ -196,6 +198,7 @@ func (n *Node) startElection() {
 
 func (n *Node) becomeLeader() {
 	n.state = Leader
+	n.leaderId = n.id
 	log.Printf("[Node %d] Became LEADER for term %d!", n.id, n.currentTerm)
 	
 	lastLogIndex := int64(len(n.log) - 1)
@@ -215,6 +218,13 @@ func (n *Node) becomeFollower(term int64) {
 	n.votedFor = -1
 	n.resetElectionTimer()
 	log.Printf("[Node %d] Became Follower for term %d", n.id, term)
+}
+
+// GetLeaderId returns the currently known leader, or -1 if unknown
+func (n *Node) GetLeaderId() int32 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.leaderId
 }
 
 func (n *Node) Submit(command string) (bool, int64, int64) {
@@ -371,6 +381,58 @@ func (n *Node) applyCommand(command string) {
 	}
 }
 
+// VerifyLeadership forces the leader to contact a majority to ensure it isn't isolated.
+func (n *Node) VerifyLeadership() bool {
+	n.mu.Lock()
+	if n.state != Leader {
+		n.mu.Unlock()
+		return false
+	}
+	
+	term := n.currentTerm
+	leaderId := n.id
+	commitIdx := n.commitIndex
+	n.mu.Unlock()
+
+	args := &pb.AppendEntriesArgs{
+		Term:         term,
+		LeaderId:     leaderId,
+		PrevLogIndex: 0, 
+		PrevLogTerm:  0,
+		Entries:      nil,
+		LeaderCommit: commitIdx,
+	}
+
+	var wg sync.WaitGroup
+	var acks int32 = 1 // Self
+	var needs = (len(n.peers) + 1) / 2
+
+	for _, peer := range n.peers {
+		client, ok := n.peerClients[peer]
+		if !ok {
+			continue
+		}
+		wg.Add(1)
+		go func(c pb.RaftServiceClient) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			defer cancel()
+			reply, err := c.AppendEntries(ctx, args)
+			if err == nil && reply.Success {
+				n.mu.Lock()
+				acks++
+				n.mu.Unlock()
+			}
+		}(client)
+	}
+
+	wg.Wait()
+	
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.state == Leader && acks >= int32(needs)
+}
+
 func (n *Node) Get(key string) (string, bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -431,6 +493,9 @@ func (n *Node) AppendEntries(ctx context.Context, args *pb.AppendEntriesArgs) (*
 	if args.Term > n.currentTerm {
 		n.becomeFollower(args.Term)
 	}
+
+	// Update our knowledge of the leader
+	n.leaderId = args.LeaderId
 
 	n.resetElectionTimer()
 	if n.state == Candidate {

@@ -57,10 +57,33 @@ func main() {
 	node.Start()
 	defer node.Stop()
 
-	// POST /submit (Accepts raw text like "SET key value")
+	// Redirect helper
+	redirectIfNeeded := func(w http.ResponseWriter, r *http.Request) bool {
+		leaderId := node.GetLeaderId()
+		if leaderId != -1 && leaderId != int32(id) {
+			// Hardcoded mapping: Node N uses HTTP port 8080 + N
+			targetUrl := fmt.Sprintf("http://localhost:%d%s", 8080+leaderId, r.URL.Path)
+			if r.URL.RawQuery != "" {
+				targetUrl += "?" + r.URL.RawQuery
+			}
+			http.Redirect(w, r, targetUrl, http.StatusTemporaryRedirect)
+			return true
+		}
+		if leaderId == -1 {
+			http.Error(w, "Cluster currently has no elected leader", http.StatusServiceUnavailable)
+			return true
+		}
+		return false
+	}
+
+	// POST /submit
 	http.HandleFunc("/submit", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Only POST supported", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if redirectIfNeeded(w, r) {
 			return
 		}
 		
@@ -78,11 +101,8 @@ func main() {
 				"term":    term,
 			})
 		} else {
-			w.WriteHeader(http.StatusServiceUnavailable) // HTTP 503 so client knows to retry elsewhere
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"success": false,
-				"message": "Not the leader",
-			})
+			// Fallback if leadership was lost exactly during processing
+			http.Error(w, "Lost leadership during processing", http.StatusServiceUnavailable)
 		}
 	})
 
@@ -92,7 +112,17 @@ func main() {
 			http.Error(w, "Only GET supported", http.StatusMethodNotAllowed)
 			return
 		}
+
+		if redirectIfNeeded(w, r) {
+			return
+		}
 		
+		// Enforce Linearizable Reads: Leader must verify it still has quorum
+		if !node.VerifyLeadership() {
+			http.Error(w, "Leader partition detected, cannot serve read", http.StatusServiceUnavailable)
+			return
+		}
+
 		key := r.URL.Query().Get("key")
 		if key == "" {
 			http.Error(w, "Missing key parameter", http.StatusBadRequest)
