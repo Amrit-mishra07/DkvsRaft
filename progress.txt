@@ -1,0 +1,12 @@
+Phase 1: Cluster Orchestration & Leader Election (Completed)
+- Set up Go module, gRPC definitions, and Docker Compose structure.
+- Implemented core Raft states: Follower, Candidate, Leader.
+- Configured randomized election timers (150-300ms) and leader heartbeats (50ms).
+- Built RequestVote RPC logic to manage elections.
+- Validated leader election and fault tolerance via container termination.
+
+Phase 2: State Machine Replication (In Progress)
+- [ ] Implement `Submit()` method for clients to send commands.
+- [ ] Track `nextIndex` and `matchIndex` for peers on the leader.
+- [ ] Implement `AppendEntries` log replication and matching logic on followers.
+- [ ] Advance `commitIndex` on leader after quorum acknowledgement.
