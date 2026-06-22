@@ -5,8 +5,14 @@ Phase 1: Cluster Orchestration & Leader Election (Completed)
 - Built RequestVote RPC logic to manage elections.
 - Validated leader election and fault tolerance via container termination.
 
-Phase 2: State Machine Replication (In Progress)
-- [ ] Implement `Submit()` method for clients to send commands.
-- [ ] Track `nextIndex` and `matchIndex` for peers on the leader.
-- [ ] Implement `AppendEntries` log replication and matching logic on followers.
-- [ ] Advance `commitIndex` on leader after quorum acknowledgement.
+Phase 2: State Machine Replication (Completed)
+- [x] Implement `Submit()` method for clients to send commands.
+- [x] Track `nextIndex` and `matchIndex` for peers on the leader.
+- [x] Implement `AppendEntries` log replication and matching logic on followers.
+- [x] Advance `commitIndex` on leader after quorum acknowledgement.
+
+Phase 3: The Application State Machine (In Progress)
+- [ ] Add a deterministic Key-Value hashmap to the Node.
+- [ ] Parse text commands (e.g., "SET key value") into executable actions.
+- [ ] Implement `applyLogs()` to process committed entries asynchronously.
+- [ ] Expose an HTTP endpoint to GET values from the KV store.

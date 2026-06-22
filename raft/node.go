@@ -31,6 +31,10 @@ type Node struct {
 	lastApplied int64
 	state       NodeState
 
+	// Volatile state on leaders
+	nextIndex  map[string]int64
+	matchIndex map[string]int64
+
 	electionTimer  *time.Timer
 	heartbeatTimer *time.Timer
 
@@ -49,17 +53,20 @@ func NewNode(id int32, peers []string) *Node {
 		votedFor:       -1,
 		log:            make([]*pb.LogEntry, 0),
 		state:          Follower,
+		nextIndex:      make(map[string]int64),
+		matchIndex:     make(map[string]int64),
 		peers:          peers,
 		peerClients:    make(map[string]pb.RaftServiceClient),
 		ctx:            ctx,
 		cancel:         cancel,
 	}
 
+	// Dummy entry at index 0
 	n.log = append(n.log, &pb.LogEntry{Term: 0, Command: ""})
 
 	n.electionTimer = time.NewTimer(n.randomElectionTimeout())
 	n.heartbeatTimer = time.NewTimer(HeartbeatInterval)
-	n.heartbeatTimer.Stop() // Only leaders tick heartbeats
+	n.heartbeatTimer.Stop()
 
 	return n
 }
@@ -75,7 +82,6 @@ func (n *Node) Stop() {
 
 func (n *Node) connectToPeers() {
 	for _, peer := range n.peers {
-		// In a production system we'd handle connection backoff/retries differently
 		conn, err := grpc.Dial(peer, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			log.Printf("[Node %d] Failed to connect to peer %s: %v", n.id, peer, err)
@@ -86,7 +92,6 @@ func (n *Node) connectToPeers() {
 }
 
 func (n *Node) randomElectionTimeout() time.Duration {
-	// 150ms to 300ms
 	return time.Duration(150+rand.Intn(150)) * time.Millisecond
 }
 
@@ -109,7 +114,7 @@ func (n *Node) runLoop() {
 		case <-n.heartbeatTimer.C:
 			n.mu.Lock()
 			if n.state == Leader {
-				n.sendHeartbeats()
+				n.sendAppendEntries()
 				n.heartbeatTimer.Reset(HeartbeatInterval)
 			}
 			n.mu.Unlock()
@@ -124,7 +129,7 @@ func (n *Node) startElection() {
 	n.resetElectionTimer()
 	log.Printf("[Node %d] Starting election for term %d", n.id, n.currentTerm)
 
-	votesReceived := 1 // Vote for self
+	votesReceived := 1
 	votesNeeded := (len(n.peers) + 1) / 2 + 1
 
 	lastLogIndex := int64(len(n.log) - 1)
@@ -154,7 +159,6 @@ func (n *Node) startElection() {
 			
 			reply, err := c.RequestVote(ctx, args)
 			if err != nil {
-				log.Printf("[Node %d] RequestVote to %s failed: %v", n.id, p, err)
 				return
 			}
 
@@ -162,7 +166,7 @@ func (n *Node) startElection() {
 			defer n.mu.Unlock()
 
 			if n.state != Candidate || n.currentTerm != args.Term {
-				return // State changed while waiting
+				return
 			}
 
 			if reply.Term > n.currentTerm {
@@ -185,8 +189,15 @@ func (n *Node) startElection() {
 func (n *Node) becomeLeader() {
 	n.state = Leader
 	log.Printf("[Node %d] Became LEADER for term %d!", n.id, n.currentTerm)
+	
+	lastLogIndex := int64(len(n.log) - 1)
+	for _, peer := range n.peers {
+		n.nextIndex[peer] = lastLogIndex + 1
+		n.matchIndex[peer] = 0
+	}
+
 	n.electionTimer.Stop()
-	n.sendHeartbeats()
+	n.sendAppendEntries()
 	n.heartbeatTimer.Reset(HeartbeatInterval)
 }
 
@@ -198,28 +209,61 @@ func (n *Node) becomeFollower(term int64) {
 	log.Printf("[Node %d] Became Follower for term %d", n.id, term)
 }
 
-func (n *Node) sendHeartbeats() {
-	lastLogIndex := int64(len(n.log) - 1)
-	lastLogTerm := n.log[lastLogIndex].Term
+// Submit allows a client to submit a command to the leader
+func (n *Node) Submit(command string) (bool, int64, int64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 
-	args := &pb.AppendEntriesArgs{
-		Term:         n.currentTerm,
-		LeaderId:     n.id,
-		PrevLogIndex: lastLogIndex,
-		PrevLogTerm:  lastLogTerm,
-		Entries:      nil, // Empty for heartbeat
-		LeaderCommit: n.commitIndex,
+	if n.state != Leader {
+		return false, -1, -1
 	}
 
+	term := n.currentTerm
+	index := int64(len(n.log))
+	n.log = append(n.log, &pb.LogEntry{Term: term, Command: command})
+
+	log.Printf("[Node %d] Accepted command '%s', appending to log index %d", n.id, command, index)
+
+	go func() {
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		if n.state == Leader {
+			n.sendAppendEntries()
+		}
+	}()
+
+	return true, index, term
+}
+
+func (n *Node) sendAppendEntries() {
 	for _, peer := range n.peers {
 		client, ok := n.peerClients[peer]
 		if !ok {
 			continue
 		}
-		go func(p string, c pb.RaftServiceClient) {
+
+		nextIdx := n.nextIndex[peer]
+		prevLogIndex := nextIdx - 1
+		prevLogTerm := n.log[prevLogIndex].Term
+		
+		var entries []*pb.LogEntry
+		if nextIdx < int64(len(n.log)) {
+			entries = n.log[nextIdx:]
+		}
+
+		args := &pb.AppendEntriesArgs{
+			Term:         n.currentTerm,
+			LeaderId:     n.id,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			Entries:      entries,
+			LeaderCommit: n.commitIndex,
+		}
+
+		go func(p string, c pb.RaftServiceClient, reqArgs *pb.AppendEntriesArgs) {
 			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 			defer cancel()
-			reply, err := c.AppendEntries(ctx, args)
+			reply, err := c.AppendEntries(ctx, reqArgs)
 			if err != nil {
 				return
 			}
@@ -227,14 +271,52 @@ func (n *Node) sendHeartbeats() {
 			n.mu.Lock()
 			defer n.mu.Unlock()
 			
+			if n.state != Leader || n.currentTerm != reqArgs.Term {
+				return
+			}
+
 			if reply.Term > n.currentTerm {
 				n.becomeFollower(reply.Term)
+				return
 			}
-		}(peer, client)
+
+			if reply.Success {
+				if len(reqArgs.Entries) > 0 {
+					n.nextIndex[p] = reqArgs.PrevLogIndex + int64(len(reqArgs.Entries)) + 1
+					n.matchIndex[p] = n.nextIndex[p] - 1
+					n.updateCommitIndex()
+				}
+			} else {
+				// Decrement nextIndex and retry 
+				n.nextIndex[p]--
+				if n.nextIndex[p] < 1 {
+					n.nextIndex[p] = 1
+				}
+			}
+		}(peer, client, args)
 	}
 }
 
-// RequestVote RPC handler
+func (n *Node) updateCommitIndex() {
+	for n.commitIndex < int64(len(n.log)-1) {
+		newCommitIndex := n.commitIndex + 1
+		matches := 1 
+		
+		for _, peer := range n.peers {
+			if n.matchIndex[peer] >= newCommitIndex {
+				matches++
+			}
+		}
+
+		if matches > len(n.peers)/2 && n.log[newCommitIndex].Term == n.currentTerm {
+			n.commitIndex = newCommitIndex
+			log.Printf("[Node %d] Leader advanced commitIndex to %d", n.id, n.commitIndex)
+		} else {
+			break
+		}
+	}
+}
+
 func (n *Node) RequestVote(ctx context.Context, args *pb.RequestVoteArgs) (*pb.RequestVoteReply, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -272,7 +354,6 @@ func (n *Node) RequestVote(ctx context.Context, args *pb.RequestVoteArgs) (*pb.R
 	return reply, nil
 }
 
-// AppendEntries RPC handler
 func (n *Node) AppendEntries(ctx context.Context, args *pb.AppendEntriesArgs) (*pb.AppendEntriesReply, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -290,12 +371,51 @@ func (n *Node) AppendEntries(ctx context.Context, args *pb.AppendEntriesArgs) (*
 		n.becomeFollower(args.Term)
 	}
 
-	// Any AppendEntries from current leader confirms they are alive
 	n.resetElectionTimer()
 	if n.state == Candidate {
 		n.becomeFollower(args.Term)
 	}
 
-	reply.Success = true // Simplified for phase 1
+	// Log Matching Property
+	if args.PrevLogIndex >= int64(len(n.log)) {
+		return reply, nil
+	}
+	if n.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		return reply, nil
+	}
+
+	// Resolve conflicts and append new entries
+	insertIndex := args.PrevLogIndex + 1
+	newEntriesIndex := 0
+
+	for {
+		if insertIndex >= int64(len(n.log)) || newEntriesIndex >= len(args.Entries) {
+			break
+		}
+		if n.log[insertIndex].Term != args.Entries[newEntriesIndex].Term {
+			n.log = n.log[:insertIndex]
+			break
+		}
+		insertIndex++
+		newEntriesIndex++
+	}
+
+	if newEntriesIndex < len(args.Entries) {
+		n.log = append(n.log, args.Entries[newEntriesIndex:]...)
+		log.Printf("[Node %d] Appended %d entries, log length is now %d", n.id, len(args.Entries)-newEntriesIndex, len(n.log))
+	}
+
+	// Update commitIndex
+	if args.LeaderCommit > n.commitIndex {
+		lastLogIndex := int64(len(n.log) - 1)
+		if args.LeaderCommit < lastLogIndex {
+			n.commitIndex = args.LeaderCommit
+		} else {
+			n.commitIndex = lastLogIndex
+		}
+		log.Printf("[Node %d] Follower advanced commitIndex to %d", n.id, n.commitIndex)
+	}
+
+	reply.Success = true
 	return reply, nil
 }
